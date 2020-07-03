@@ -20,7 +20,7 @@ from dateutil.relativedelta import relativedelta
 logger = logging.getLogger(__name__)
 
 
-def bootstrap(model, train_df, y_df, test_df, n_bootstraps: int = 100, confidence=0.50) -> float:
+def bootstrap(model, train_df, y_df, test_df, n_bootstraps: int = 1, confidence=0.50) -> float:
     """Runs model `model` using different random sampled train & test splits.
 
     Returns:
@@ -92,15 +92,19 @@ class EMCEB(TadpoleModel):
             train_df = train_df.rename(columns={"DXCHANGE": "Diagnosis"})
 
         # Adds months to age
-        train_df['AGE'] += train_df['Month_bl'] / 12.
+        if 'Month_bl' in train_df.columns:
+            train_df['AGE'] += train_df['Month_bl'] / 12.
 
         # Drop columns found unimportant by feature importance ranking measure.
         h = list(train_df)
-        train_df: pd.DataFrame = train_df.drop(
-            h[1:8] + [h[9]] + h[14:17] + h[45:47] + h[53:73] + h[74:486] + h[832:838] + h[1172:1174] + \
-            h[1657:1667] + h[1895:1902] + h[1905:],
-            axis=1
-        )
+        if 'Month_bl' in train_df.columns:
+            train_df: pd.DataFrame = train_df.drop(
+                h[1:8] + [h[9]] + h[14:17] + h[45:47] + h[53:73] + h[74:486] + h[832:838] + h[1172:1174] + \
+                h[1657:1667] + h[1895:1902] + h[1905:],
+                axis=1
+            )
+        else:
+            train_df = train_df.drop(([h[1]]+h[7:11]+h[20:37], 1))
 
         h = list(train_df)
 
@@ -110,7 +114,7 @@ class EMCEB(TadpoleModel):
                 train_df[h[i]] = pd.to_numeric(train_df[h[i]], errors='coerce')
 
         """Sort the DataFrame per patient on age (at time of visit). This allows using observations from
-        the next row/visit to be used as a label for the previous row. (See `get_futures` method.)"""
+        the next row/visit to be used as a label for the previous row. (See `set_futures` method.)"""
         train_df = train_df.sort_values(by=['RID', 'AGE'])
 
         train_df = train_df.drop(['EXAMDATE', 'AGE', 'PTGENDER', 'PTEDUCAT', 'APOE4'], axis=1)
@@ -134,13 +138,13 @@ class EMCEB(TadpoleModel):
         return train_df
 
     @staticmethod
-    def get_futures(train_df, features=['RID', 'Diagnosis', 'ADAS13', 'Ventricles_ICV']):
+    def set_futures(train_df, features=['RID', 'Diagnosis', 'ADAS13', 'Ventricles_ICV']):
         """For each feature in `features` argument, generate a `Future_{feature}` column, that is filled
         using the next row for each patient"""
 
         futures_df = train_df[features].copy()
 
-        # Get future value from each row's next row, e.g. shift the column one up
+        # Set future value based on each row's next row, e.g. shift the column one up
         for predictor in ["Diagnosis", "ADAS13", 'Ventricles_ICV']:
             futures_df["Future_" + predictor] = futures_df[predictor].shift(-1)
 
@@ -158,7 +162,7 @@ class EMCEB(TadpoleModel):
 
     def train(self, train_df):
         train_df = self.preprocess(train_df)
-        futures = self.get_futures(train_df)
+        futures = self.set_futures(train_df)
 
         # Not part of `preprocess` because it's needed for the futures.
         train_df = train_df.drop(['RID'], axis=1)
@@ -204,7 +208,7 @@ class EMCEB(TadpoleModel):
 
         diag_probas = self.diagnosis_model.predict_proba(test_df)
         adas_prediction = self.adas_model.predict(test_df)
-        ventricles_prediction = self.adas_model.predict(test_df)
+        ventricles_prediction = self.ventricles_model.predict(test_df)
 
         if self.confidence_intervals:
             logger.info("Bootstrap adas")

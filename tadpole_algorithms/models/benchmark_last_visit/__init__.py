@@ -13,6 +13,8 @@ import numpy as np
 import os
 import sys
 
+from tadpole_algorithms.models.tadpole_model import TadpoleModel
+
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 
@@ -24,7 +26,7 @@ from dateutil.relativedelta import relativedelta
 logger = logging.getLogger(__name__)
 
 
-class BenchmarkLastVisit:
+class BenchmarkLastVisit(TadpoleModel):
     def preprocess(self, train_df):
         logger.info("Pre-processing")
         train_df = train_df.copy()
@@ -33,7 +35,8 @@ class BenchmarkLastVisit:
             train_df = train_df.rename(columns={"DXCHANGE": "Diagnosis"})
 
         # Sort the dataframe based on age for each subject
-        train_df = train_df.sort_values(by=['RID', 'Years_bl'])
+        if 'Years_bl' in train_df.columns:
+            train_df = train_df.sort_values(by=['RID', 'Years_bl'])
 
         # Ventricles_ICV = Ventricles/ICV_bl. So make sure ICV_bl is not zero to avoid division by zero
         icv_bl_median = train_df['ICV_bl'].median()
@@ -107,6 +110,8 @@ class BenchmarkLastVisit:
                 # ventricles volume of 25000 & wide confidence interval +/-20000
                 ventricles_prediction[i] = Ventricles_typical
                 ventricles_ci[i] = Ventricles_broad_50pcMargin 
+        
+        diag_probas_t = diag_probas.T.copy()
 
         def add_months_to_str_date(strdate, months=1):
             try:
@@ -118,9 +123,9 @@ class BenchmarkLastVisit:
             'RID': subjects,
             'month': 1,
             'Forecast Date': list(map(lambda x: add_months_to_str_date(x, 1), exam_dates.tolist())),
-            'CN relative probability': diag_probas.T[0],
-            'MCI relative probability': diag_probas.T[1],
-            'AD relative probability': diag_probas.T[2],
+            'CN relative probability': diag_probas_t[0],
+            'MCI relative probability': diag_probas_t[1],
+            'AD relative probability': diag_probas_t[2],
 
             'ADAS13': adas_prediction,
             'ADAS13 50% CI lower': adas_prediction - adas_ci, # To do: Set to zero if best-guess less than 1.

@@ -4,6 +4,8 @@ from sklearn import svm
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
+from tadpole_algorithms.models.tadpole_model import TadpoleModel
+
 import logging
 
 from datetime import datetime
@@ -12,7 +14,7 @@ from dateutil.relativedelta import relativedelta
 logger = logging.getLogger(__name__)
 
 
-class BenchmarkSVM:
+class BenchmarkSVM(TadpoleModel):
     def __init__(self):
         self.diagnosis_model = Pipeline([
             ('scaler', StandardScaler()),
@@ -43,7 +45,8 @@ class BenchmarkSVM:
             train_df = train_df.rename(columns={"DXCHANGE": "Diagnosis"})
 
         # Sort the dataframe based on age for each subject
-        train_df = train_df.sort_values(by=['RID', 'Years_bl'])
+        if 'Years_bl' in train_df.columns:
+            train_df = train_df.sort_values(by=['RID', 'Years_bl'])
 
         # Ventricles_ICV = Ventricles/ICV_bl. So make sure ICV_bl is not zero to avoid division by zero
         icv_bl_median = train_df['ICV_bl'].median()
@@ -63,7 +66,7 @@ class BenchmarkSVM:
         return train_df
 
     def set_futures(self, train_df):
-        # Get future value from each row's next row, e.g. shift the column one up
+        # Set future value based on each row's next row, e.g. shift the column one up
         for predictor in ["Diagnosis", "ADAS13", 'Ventricles_ICV']:
             train_df["Future_" + predictor] = train_df[predictor].shift(-1)
 
@@ -90,8 +93,9 @@ class BenchmarkSVM:
         logger.info("Predicting")
 
         # select last row per RID
-        test_df = test_df.sort_values(by=['EXAMDATE'])
-        test_df = test_df.groupby('RID').tail(1)
+        if len(test_df[test_df.duplicated(['RID'])]) != 0:
+            test_df = test_df.sort_values(by=['EXAMDATE'])
+            test_df = test_df.groupby('RID').tail(1)
         exam_dates = test_df['EXAMDATE']
 
         test_df = self.preprocess(test_df)
@@ -108,7 +112,7 @@ class BenchmarkSVM:
 
         adas_ci = np.zeros(len(adas_prediction))
 
-        ventricles_prediction = self.adas_model.predict(test_df)
+        ventricles_prediction = self.ventricles_model.predict(test_df)
         ventricles_ci = np.zeros(len(ventricles_prediction))
 
         def add_months_to_str_date(strdate, months=1):
