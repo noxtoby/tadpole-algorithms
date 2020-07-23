@@ -4,11 +4,16 @@ from pathlib import Path
 
 import pandas as pd
 import scipy as sp
+import numpy as np
 from scipy import stats
 from sklearn import svm
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
+
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+import importlib.resources as pkg_resources
 
 from tqdm.auto import tqdm
 
@@ -16,6 +21,9 @@ from tadpole_algorithms.models.tadpole_model import TadpoleModel
 
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+
+import pystan
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +47,21 @@ def bootstrap(model, train_df, y_df, test_df, n_bootstraps: int = 100, confidenc
     # m-h and m+h give confidence interval
     return h
 
+def check_for_save_file(file_name,function=None):
+    if os.path.isfile(file_name):
+        print('check_for_save_file(): File detected ({0}) - you can load data.'.format(file_name))
+        #ebm_save = sio.loadmat(file_name)
+        return 1
+    else:
+        if function is None:
+            print('No save file found')
+        else:
+            print('No save file found: you should call your function {0}'.format(function.__name__))
+        return 0
+
 
 class DEM(TadpoleModel):
-    """Differential Equation Model, Neil Oxtoby - neil@neiloxtoby.com
+    """Differential Equation Model method, Neil Oxtoby - neil@neiloxtoby.com
 
     The `train_df*` attributes contain training data optimized for each variable.
 
@@ -58,25 +78,27 @@ class DEM(TadpoleModel):
     """
 
     def __init__(self, confidence_intervals=True):
-        self.diagnosis_model = Pipeline([
-            ('scaler', StandardScaler()),
-            ('classifier', svm.SVC(kernel='rbf', C=0.5, gamma='auto', class_weight='balanced', probability=True)),
-        ])
-        self.adas_model = Pipeline([
-            ('scaler', StandardScaler()),
-            ('classifier', svm.SVR(kernel='rbf', C=0.5, gamma='auto')),
-        ])
-        self.ventricles_model = Pipeline([
-            ('scaler', StandardScaler()),
-            ('classifier', svm.SVR(kernel='rbf', C=0.5, gamma='auto')),
-        ])
+        # self.diagnosis_model = Pipeline([
+        #     ('scaler', StandardScaler()),
+        #     ('classifier', svm.SVC(kernel='rbf', C=0.5, gamma='auto', class_weight='balanced', probability=True)),
+        # ])
+        # self.adas_model = Pipeline([
+        #     ('scaler', StandardScaler()),
+        #     ('classifier', svm.SVR(kernel='rbf', C=0.5, gamma='auto')),
+        # ])
+        # self.ventricles_model = Pipeline([
+        #     ('scaler', StandardScaler()),
+        #     ('classifier', svm.SVR(kernel='rbf', C=0.5, gamma='auto')),
+        # ])
 
-        self.y_diagnosis = None
-        self.y_adas = None
+        self.df_dem_fits = None
+
+        self.y_diagnosis  = None
+        self.y_adas       = None
         self.y_ventricles = None
 
-        self.train_df_diagnosis = None
-        self.train_df_adas = None
+        self.train_df_diagnosis  = None
+        self.train_df_adas       = None
         self.train_df_ventricles = None
 
         self.confidence_intervals = confidence_intervals
@@ -88,50 +110,217 @@ class DEM(TadpoleModel):
         if 'Diagnosis' not in train_df.columns:
             """We want to transform 'DXCHANGE' (a change in diagnosis, in contrast
             to the previous visits diagnosis) to an actual diagnosis."""
-            train_df = train_df.replace({'DXCHANGE': {4: 2, 5: 3, 6: 3, 7: 1, 8: 2, 9: 1}})
-            train_df = train_df.rename(columns={"DXCHANGE": "Diagnosis"})
+            train_df = train_df.replace({
+               'DX': {
+                   'NL'             :1,
+                   'MCI to NL'      :1,
+                   'Dementia to NL' :1,
+                   'MCI'            :2,
+                   'NL to MCI'      :2,
+                   'Dementia to MCI':2,
+                   'Dementia'       :3,
+                   'MCI to Dementia':3,
+                   'NL to Dementia' :3
+               }
+            })
+            train_df.rename(columns={"DX": "Diagnosis"},inplace=True)
+            #train_df['Diagnosis'] = train_df['DXCHANGE'].values
+        
+        #* Adjust AGE at baseline to VISITAGE
+        train_df['VISITAGE'] = train_df['AGE'] + train_df['Years_bl']
 
-        # Adds months to age
-        train_df['AGE'] += train_df['Month_bl'] / 12.
-
-        # Drop columns found unimportant by feature importance ranking measure.
-        h = list(train_df)
-        train_df: pd.DataFrame = train_df.drop(
-            h[1:8] + [h[9]] + h[14:17] + h[45:47] + h[53:73] + h[74:486] + h[832:838] + h[1172:1174] + \
-            h[1657:1667] + h[1895:1902] + h[1905:],
-            axis=1
-        )
-
-        h = list(train_df)
-
-        logger.info('Forcing Numeric Values')
-        for i in range(5, len(h)):
-            if train_df[h[i]].dtype != 'float64':
-                train_df[h[i]] = pd.to_numeric(train_df[h[i]], errors='coerce')
-
-        """Sort the DataFrame per patient on age (at time of visit). This allows using observations from
-        the next row/visit to be used as a label for the previous row. (See `get_futures` method.)"""
-        train_df = train_df.sort_values(by=['RID', 'AGE'])
-
-        train_df = train_df.drop(['EXAMDATE', 'AGE', 'PTGENDER', 'PTEDUCAT', 'APOE4'], axis=1)
-
-        # Ventricles_ICV = Ventricles/ICV_bl. So make sure ICV_bl is not zero to avoid division by zero
+        # Divide certain volumes by ICV. Could add more...
+        dem_markers = [
+            'WholeBrain_ICV', 'Hippocampus_ICV', 'Ventricles_ICV', 'Entorhinal_ICV',
+            'MMSE', 'ADAS13'
+        ]
+        #* Avoid divide-by-zero errors: code by Esther Bron
         icv_bl_median = train_df['ICV_bl'].median()
         train_df.loc[train_df['ICV_bl'] == 0, 'ICV_bl'] = icv_bl_median
 
-        if 'Ventricles_ICV' not in train_df.columns:
-            train_df["Ventricles_ICV"] = train_df["Ventricles"].values / train_df["ICV_bl"].values
+        for vol in ['WholeBrain', 'Hippocampus', 'Ventricles', 'Entorhinal']:
+            train_df[vol+'_ICV'] = train_df[vol].values/train_df['ICV_bl'].values
+            #test_df[vol+'_ICV'] = test_df[vol].values/test_df['ICV_bl'].values
 
-        """Select features based on EMCEB_features.csv file"""
-        selected_features = pd.read_csv(Path(__file__).parent / 'EMCEB_features.csv')['feature'].values.tolist()
-        selected_features = selected_features[0:200]
-        selected_features += ['RID', 'Diagnosis', 'Ventricles_ICV']
+        logger.info('Forcing Numeric Values')
+        for i in range(5, len(dem_markers)):
+            if train_df[dem_markers[i]].dtype != 'float64':
+                train_df[dem_markers[i]] = pd.to_numeric(train_df[dem_markers[i]], errors='coerce')
+
+        """Sort the DataFrame per patient on age (at time of visit). This allows using observations from
+        the next row/visit to be used as a label for the previous row. (See `get_futures` method.)"""
+        train_df = train_df.sort_values(by=['RID', 'VISITAGE'])
+
+        #train_df = train_df.drop(['EXAMDATE', 'AGE', 'PTGENDER', 'PTEDUCAT', 'APOE4'], axis=1)
+        """Select features based on Billabong_features.csv file"""
+        features_csv_path = Path(__file__).parent / 'Billabong_features.csv'
+        selected_features = pd.read_csv(features_csv_path)['feature'].values.tolist()
+        selected_features += ['RID', 'Diagnosis', 'Years_bl']
         selected_features = set(selected_features)
         train_df = train_df.copy()[selected_features]
 
-        train_df = EMCEB.fill_nans_by_older_values(train_df)
+        train_df = DEM.fill_nans_by_older_values(train_df)
 
-        return train_df
+        #* Preprocessing for DEM model
+        df_dem = DEM.dem_gradients(
+            df=train_df,
+            markers=dem_markers,
+            t_col='Years_bl',
+            dx_col='Diagnosis'
+        )
+        #* Postselect: exclude non-progressing, non-abnormal
+        df_dem_, df_postselection = DEM.dem_postselect(df_dem=df_dem,markers=dem_markers,dx_col='Diagnosis.bl')
+
+        #* Optionally subsample to reduce the dimensions (fitting can take quite some time)
+        subsample = 3
+        #- Sort biomarkers to approximate getting even coverage
+        df_dem__ = df_dem_.sort_values(by=[d+'-mean' for d in dem_markers])
+        df_dem__.reset_index(drop=True, inplace=True)
+        n_subsample = int(df_dem__.shape[0]/subsample)
+        s = np.arange(0,df_dem__.shape[0],int(df_dem__.shape[0]/n_subsample))
+        df_dem__ = df_dem__.loc[s]
+
+        return df_dem__
+
+    @staticmethod
+    def dxdt(x,t):
+        #* Fit a GLM using statsmodels
+        glm_formula = 'x ~ t'
+        mod = smf.ols(formula=glm_formula, data={'x':x,'t':t})
+        res = mod.fit()
+        return res.params[1]
+
+    @staticmethod
+    def dem_gradients(df,
+            markers,
+            id_col='RID',
+            t_col='Years_bl',
+            dx_col = 'Diagnosis',
+            n_timepoints_min=2):
+        """
+        dem_gradients()
+        Calculates individual gradients from longitudinal data and 
+        returns a cross-section of differential data
+        Neil Oxtoby, UCL, November 2018
+        """
+        #* Remove individuals without enough data
+        counts = df.groupby([id_col]).agg(['count'])
+        counts.reset_index(inplace=True)
+        has_long_data = (np.all(counts>=n_timepoints_min,axis=1))
+        rid_include = counts[id_col][ has_long_data ].values
+        #* Add baseline DX
+        counts = counts.merge(df.loc[df[t_col]==0,[id_col,dx_col]].rename(columns={dx_col:dx_col+'.bl'}),on='RID')
+        dxbl_include = counts[dx_col+'.bl'][ has_long_data ].values
+        #* Baseline DX
+        df = df.merge(df.loc[df[t_col]==0,[id_col,dx_col]].rename(columns={dx_col:dx_col+'.bl'}))
+        id_dxbl = df[[id_col,dx_col+'.bl']]
+        #* Keep only RID included
+        df_ = df.loc[ df[id_col].isin(rid_include) ]
+        #* Add baseline DX
+        df_ = df_.merge(id_dxbl)
+
+        #* Calculate gradients
+        df_dem = pd.DataFrame(data={id_col:rid_include,dx_col+'.bl':dxbl_include})
+        for i in df_dem[id_col]:
+            rowz = i==df_[id_col]
+            rowz_dem = i==df_dem[id_col]
+            t = df_.loc[rowz,t_col]
+            for m in markers:
+                x = df_.loc[rowz,m]
+                df_dem.loc[rowz_dem,m+'-mean'] = np.mean(x)
+                df_dem.loc[rowz_dem,m+'-grad'] = DEM.dxdt(x,t)
+
+        return df_dem
+
+    @staticmethod
+    def dem_postselect(df_dem,markers,dx_col='Diagnosis'):
+        """
+        Postselects differential data, a la Villemagne 2013:
+        - Omits non-progressing (negative gradient), non-abnormal (less than biomarker median of CN) differential data
+        Neil Oxtoby, UCL, November 2018
+        """
+        #dx_dict = {1:'CN',2:'MCI',3:'AD',4:'CNtoMCI',5:'MCItoAD',6:'CNtoAD',7:'MCItoCN',8:'ADtoMCI',9:'ADtoCN'}
+        x_text = '-mean'
+        y_text = '-grad'
+
+        df_postelection = pd.DataFrame(data={'Marker':markers})
+
+        #* 1. Restrict to MCI and AD - purifies, but might also remove presymptomatics in CN
+        dx_included = [2,3]
+        df_ = df_dem.loc[df_dem[dx_col].isin(dx_included)].copy()
+
+        #* 2. Exclude normal and non-progressing
+        for m in markers:
+            #* 2.1 Normal threshold = median of CN (alt: use clustering)
+            normal_threshold = df_dem.loc[df_dem[dx_col].isin([1]),m+x_text].median()
+            #* 2.2 Non-progressing = negative gradient
+            nonprogress_threshold = 0
+            excluded_rows = (df_[m+x_text] < normal_threshold) & (df_[m+y_text] < nonprogress_threshold)
+
+            df_postelection.loc[df_postelection['Marker']==m,'Normal-Threshold'] = normal_threshold
+
+        return df_, df_postelection
+
+    @staticmethod
+    def fit_dem(df_dem,stan_model):
+        """
+        dem_fit = fit_dem(df_dem,stan_model)
+        """
+        x_text = '-mean'
+        y_text = '-grad'
+        markers = df_dem.columns.tolist()
+        markers = [m.replace(x_text,'') for m in markers if 'mean' in m]
+
+        df_dem_fits = pd.DataFrame(data={'Marker':markers})
+
+        # #* 1. Linear regression
+        # slope, intercept, r_value, p_value, std_err = stats.linregress(x_,dxdt_)
+        # DEMfit = {'linreg_slope':slope}
+        # DEMfit['linreg_intercept'] = intercept
+        # DEMfit['linreg_r_value'] = r_value
+        # DEMfit['linreg_p_value'] = p_value
+        # DEMfit['linreg_std_err'] = std_err
+
+        for m in markers:
+            x = df_dem[m+x_text].values
+            y = df_dem[m+y_text].values
+            i = np.argsort(x)
+            x = x[i]
+            y = y[i]
+
+            #* GPR setup: hyperparameters, etc.
+            x_scale = (max(x)-min(x))
+            y_scale = (max(y)-min(y))
+            sigma_scale = 0.1*y_scale
+
+            x_predict = np.linspace(min(x),max(x),20)
+            N_predict = len(x_predict)
+            #* MCMC CHAINS: initial values
+            rho_i = x_scale/2
+            alpha_i = y_scale/2
+            sigma_i = sigma_scale
+            init = {'rho':rho_i, 'alpha':alpha_i, 'sigma':sigma_i}
+            dem_gpr_dat = {
+                'N': len(x),
+                'x': x,
+                'y': y,
+                'x_scale' : x_scale,
+                'y_scale' : y_scale,
+                'sigma_scale' : sigma_scale,
+                'x_predict'   : x_predict,
+                'N_predict'   : N_predict
+            }
+            df_dem_fits.loc[df_dem_fits['Marker']==m,'x_predict'] = x_predict
+
+            txt = 'Performing GPR for {0}'.format(m)
+            print(txt)
+            logger.info(txt)
+            fit = stan_model.sampling(data=dem_gpr_dat,
+                                      init=[init,init,init,init],
+                                      iter=1000,
+                                      chains=4)
+            df_dem_fits.loc[df_dem_fits['Marker']==m,'pystan_fit_gpr'] = fit
+        return df_dem_fits
 
     @staticmethod
     def get_futures(train_df, features=['RID', 'Diagnosis', 'ADAS13', 'Ventricles_ICV']):
@@ -157,37 +346,58 @@ class DEM(TadpoleModel):
         return train_df
 
     def train(self, train_df):
-        train_df = self.preprocess(train_df)
-        futures = self.get_futures(train_df)
+        df_dem = self.preprocess(train_df)
 
-        # Not part of `preprocess` because it's needed for the futures.
-        train_df = train_df.drop(['RID'], axis=1)
-
-        # Fill left over nans with mean
-        train_df = train_df.fillna(train_df.mean())
-        train_df = train_df.fillna(0)
-
-        def non_nan_y(_train_df, _y_df):
-            """Drops all rows with a `y` value that is NaN
-
-            Returns:
-                Tuple containing (`train_df`, `y_df`), without NaNs for `y_df`.
-            """
-
-            # indices where the y value is not nan
-            not_nan_idx = _y_df[_y_df.notna()].index
-
-            # return from both the train dataframe and y the records with these indices
-            return _train_df.loc[not_nan_idx], _y_df[not_nan_idx]
-
-        self.train_df_diagnosis, self.y_diagnosis = non_nan_y(train_df, futures['Future_Diagnosis'])
-        self.train_df_adas, self.y_adas = non_nan_y(train_df, futures['Future_ADAS13'])
-        self.train_df_ventricles, self.y_ventricles = non_nan_y(train_df, futures['Future_Ventricles_ICV'])
+        #* Esther code
+        # futures = self.get_futures(train_df)
+        # # Not part of `preprocess` because it's needed for the futures.
+        # train_df = train_df.drop(['RID'], axis=1)
+        # # Fill left over nans with mean
+        # train_df = train_df.fillna(train_df.mean())
+        # train_df = train_df.fillna(0)
+        # def non_nan_y(_train_df, _y_df):
+        #     """Drops all rows with a `y` value that is NaN
+        #
+        #     Returns:
+        #         Tuple containing (`train_df`, `y_df`), without NaNs for `y_df`.
+        #     """
+        #
+        #     # indices where the y value is not nan
+        #     not_nan_idx = _y_df[_y_df.notna()].index
+        #
+        #     # return from both the train dataframe and y the records with these indices
+        #     return _train_df.loc[not_nan_idx], _y_df[not_nan_idx]
+        #
+        # self.train_df_diagnosis, self.y_diagnosis = non_nan_y(train_df, futures['Future_Diagnosis'])
+        # self.train_df_adas, self.y_adas = non_nan_y(train_df, futures['Future_ADAS13'])
+        # self.train_df_ventricles, self.y_ventricles = non_nan_y(train_df, futures['Future_Ventricles_ICV'])
 
         logger.info("Training models")
-        self.diagnosis_model.fit(self.train_df_diagnosis, self.y_diagnosis)
-        self.adas_model.fit(self.train_df_adas, self.y_adas)
-        self.ventricles_model.fit(self.train_df_ventricles, self.y_ventricles)
+        # Prep for Gaussian Process regression
+        gpr_stan_code = Path(__file__).parent / 'gp_betancourt.stan'
+        dem_gpr_stan_model = pystan.StanModel(file=gpr_stan_code.as_posix(),model_name='gpr_dem')
+        # Check for saved results and fit
+        fname_save_pystan_fits = "DEM-results-pickle-pystan-fits"
+        check_flag = check_for_save_file(file_name=fname_save_pystan_fits,function=None)
+        if check_flag: #"dem_gpr_stan_model_fits" in pystan_results:
+            print('DEM.train():           Not fitting DEMs: existing results detected.')
+            pickle_file = open(fname_save_pystan_fits,'rb')
+            pystan_results = pickle.load(pickle_file)
+            dem_gpr_stan_model_fits = pystan_results["dem_gpr_stan_model_fits"]
+            pickle_file.close()
+            #dem_gpr_stan_model_fits = pystan_results["dem_gpr_stan_model_fits"]
+        else:
+            print('DEM.train():           Fitting DEMs using GP regression')
+            self.df_dem_fits = self.fit_dem(df_dem,dem_gpr_stan_model)
+            #* Save the fits to a new pickle file - the StanModel mmust be unpickled first
+            pystan_results["dem_gpr_stan_model_fits"] = df_dem_fits
+            pickle_file = open(fname_save_pystan_fits,'wb')
+            pickle_output = pickle.dump(pystan_results,pickle_file)
+            pickle_file.close()
+
+        # self.diagnosis_model.fit(self.train_df_diagnosis, self.y_diagnosis)
+        # self.adas_model.fit(self.train_df_adas, self.y_adas)
+        # self.ventricles_model.fit(self.train_df_ventricles, self.y_ventricles)
 
     def predict(self, test_df):
         logger.info("Predicting")
