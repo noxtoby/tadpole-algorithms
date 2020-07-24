@@ -5,7 +5,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 from tadpole_algorithms.models.tadpole_model import TadpoleModel
-
 import logging
 
 from datetime import datetime
@@ -97,7 +96,6 @@ class BenchmarkSVM(TadpoleModel):
         # fill NaNs with mean
         X_train = X_train.fillna(X_train.mean())
 
-        
         logger.info("Training models")
         self.train_model(self.diagnosis_model, train_df, X_train, "Future_Diagnosis")
         if "ADAS13" in train_df.columns:
@@ -167,6 +165,7 @@ class BenchmarkSVM(TadpoleModel):
                 'Ventricles_ICV 50% CI lower': ventricles_prediction - ventricles_ci,
                 'Ventricles_ICV 50% CI upper': ventricles_prediction + ventricles_ci,
             })
+
 
         # copy each row for each month
         new_df = df.copy()
